@@ -1,0 +1,696 @@
+
+# ============================================================
+# PROJETO STRIDEZONE - PESQUISA OPERACIONAL
+# Maximização do lucro + Minimização dos custos de transporte
+# Cenários What-If
+# ============================================================
+
+# 1. IMPORTAÇÃO DAS BIBLIOTECAS
+import sys
+import subprocess
+import importlib.util
+
+# Instala o openpyxl caso não esteja disponível
+if importlib.util.find_spec("openpyxl") is None:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "openpyxl"])
+
+import pandas as pd
+import numpy as np
+import unicodedata
+from google.colab import files
+from scipy.optimize import milp, Bounds, LinearConstraint
+from scipy.sparse import csr_matrix
+
+print("=" * 65)
+print("PESQUISA OPERACIONAL - STRIDEZONE")
+print("=" * 65)
+
+
+# ============================================================
+# 2. UPLOAD E LEITURA DA PLANILHA
+# ============================================================
+
+print("\nEnvie a planilha original da StrideZone.")
+
+arquivos = files.upload()
+
+if not arquivos:
+    raise ValueError("Nenhum arquivo foi enviado.")
+
+nome_arquivo = next(iter(arquivos.keys()))
+
+if not nome_arquivo.lower().endswith((".xlsx", ".xls")):
+    raise ValueError("Envie uma planilha Excel no formato .xlsx ou .xls.")
+
+excel = pd.ExcelFile(nome_arquivo)
+
+if "Vendas" not in excel.sheet_names:
+    raise ValueError(
+        "A planilha precisa conter uma aba chamada 'Vendas'. "
+        f"Abas encontradas: {excel.sheet_names}"
+    )
+
+df = pd.read_excel(nome_arquivo, sheet_name="Vendas")
+
+print("\nPlanilha carregada:", nome_arquivo)
+print("Registros encontrados:", len(df))
+
+
+# ============================================================
+# 3. TRATAMENTO DOS DADOS
+# ============================================================
+
+def normalizar_texto(valor):
+    texto = str(valor).strip().lower()
+    texto = unicodedata.normalize("NFKD", texto)
+    texto = "".join(
+        caractere for caractere in texto
+        if not unicodedata.combining(caractere)
+    )
+    return texto
+
+
+# Normaliza nomes das colunas para facilitar a identificação
+df.columns = [normalizar_texto(c) for c in df.columns]
+
+colunas_obrigatorias = [
+    "pedido_id",
+    "modelo",
+    "cd_origem",
+    "quantidade",
+    "desconto_pct",
+    "unidades_devolvidas"
+]
+
+faltantes = [
+    coluna for coluna in colunas_obrigatorias
+    if coluna not in df.columns
+]
+
+if faltantes:
+    raise ValueError(
+        "A aba Vendas não contém todas as colunas necessárias: "
+        + ", ".join(faltantes)
+    )
+
+# Remove linhas totalmente duplicadas
+df = df.drop_duplicates().copy()
+
+# Converte os campos numéricos
+for coluna in [
+    "quantidade",
+    "desconto_pct",
+    "unidades_devolvidas"
+]:
+    df[coluna] = pd.to_numeric(df[coluna], errors="coerce")
+
+# Remove registros sem informações essenciais
+df = df.dropna(
+    subset=[
+        "pedido_id",
+        "modelo",
+        "cd_origem",
+        "quantidade",
+        "desconto_pct"
+    ]
+).copy()
+
+# Remove quantidades inválidas
+df = df[df["quantidade"] > 0].copy()
+
+# Trata descontos em percentual
+if not df.empty and df["desconto_pct"].max() > 1:
+    df["desconto_pct"] = df["desconto_pct"] / 100
+
+df["desconto_pct"] = df["desconto_pct"].clip(0, 1)
+
+# Trata devoluções
+df["unidades_devolvidas"] = (
+    df["unidades_devolvidas"]
+    .fillna(0)
+    .clip(lower=0)
+)
+
+df["unidades_devolvidas"] = np.minimum(
+    df["unidades_devolvidas"],
+    df["quantidade"]
+)
+
+# Padroniza os nomes dos modelos
+df["modelo"] = df["modelo"].astype(str).str.strip()
+
+if df.empty:
+    raise ValueError("Não existem registros válidos na aba Vendas.")
+
+print("\nTratamento dos dados concluído.")
+print("Registros válidos:", len(df))
+
+
+# ============================================================
+# 4. PARÂMETROS DA STRIDEZONE
+# ============================================================
+
+# Valores de referência do material da empresa:
+# preço de venda, custo unitário e limite de planejamento.
+
+produtos = {
+    "StrideRun X1": {
+        "preco": 459,
+        "custo": 210,
+        "limite": 320
+    },
+    "StrideRun Pro": {
+        "preco": 699,
+        "custo": 340,
+        "limite": 150
+    },
+    "Urban Casual 02": {
+        "preco": 299,
+        "custo": 130,
+        "limite": 500
+    },
+    "Urban Casual Lite": {
+        "preco": 219,
+        "custo": 95,
+        "limite": 600
+    },
+    "Skate Deck One": {
+        "preco": 349,
+        "custo": 160,
+        "limite": 220
+    }
+}
+
+ORCAMENTO = 180000
+CAPACIDADE_TOTAL = 12000
+
+# Cenário alternativo: redução do orçamento
+ORCAMENTO_WHAT_IF = 120000
+
+# Frete por pedido
+FRETE_LOCAL = 18
+FRETE_ENTRE_REGIOES = 30
+FRETE_ENTRE_REGIOES_WHAT_IF = 45
+
+
+# ============================================================
+# 5. CÁLCULO DAS MARGENS ESTIMADAS
+# ============================================================
+
+margens = {}
+custos = {}
+limites = {}
+
+for modelo, dados in produtos.items():
+
+    dados_modelo = df[
+        df["modelo"].map(normalizar_texto)
+        == normalizar_texto(modelo)
+    ].copy()
+
+    if dados_modelo.empty:
+        desconto_medio = 0
+        taxa_devolucao = 0
+    else:
+        quantidade_total = dados_modelo["quantidade"].sum()
+
+        desconto_medio = np.average(
+            dados_modelo["desconto_pct"],
+            weights=dados_modelo["quantidade"]
+        )
+
+        taxa_devolucao = (
+            dados_modelo["unidades_devolvidas"].sum()
+            / quantidade_total
+        )
+
+    # Receita estimada por unidade após desconto e devoluções
+    receita_liquida = (
+        dados["preco"]
+        * (1 - desconto_medio)
+        * (1 - taxa_devolucao)
+    )
+
+    # Margem estimada por unidade
+    margem_unitaria = receita_liquida - dados["custo"]
+
+    margens[modelo] = margem_unitaria
+    custos[modelo] = dados["custo"]
+    limites[modelo] = dados["limite"]
+
+
+df_margens = pd.DataFrame({
+    "Modelo": list(produtos.keys()),
+    "Preço de venda (R$)": [
+        produtos[m]["preco"] for m in produtos
+    ],
+    "Custo unitário (R$)": [
+        custos[m] for m in produtos
+    ],
+    "Margem estimada unitária (R$)": [
+        margens[m] for m in produtos
+    ],
+    "Limite de planejamento": [
+        limites[m] for m in produtos
+    ]
+})
+
+print("\nMARGENS ESTIMADAS POR PRODUTO")
+print(df_margens.to_string(index=False))
+
+
+# ============================================================
+# 6. FUNÇÃO DE MAXIMIZAÇÃO DO LUCRO
+# ============================================================
+
+def resolver_maximizacao(orcamento):
+
+    modelos = list(produtos.keys())
+    n = len(modelos)
+
+    # O scipy.optimize.milp trabalha com minimização.
+    # Por isso, multiplicamos as margens por -1.
+    objetivo = np.array([
+        -margens[m] for m in modelos
+    ], dtype=float)
+
+    # Restrição 1: orçamento disponível
+    # Restrição 2: capacidade total dos centros de distribuição
+
+    matriz = np.array([
+        [custos[m] for m in modelos],
+        [1 for m in modelos]
+    ], dtype=float)
+
+    limites_superiores = np.array([
+        orcamento,
+        CAPACIDADE_TOTAL
+    ], dtype=float)
+
+    restricoes = LinearConstraint(
+        matriz,
+        lb=np.array([-np.inf, -np.inf]),
+        ub=limites_superiores
+    )
+
+    # Quantidades inteiras e não negativas
+    resultado = milp(
+        c=objetivo,
+        integrality=np.ones(n),
+        bounds=Bounds(
+            lb=np.zeros(n),
+            ub=np.array([limites[m] for m in modelos])
+        ),
+        constraints=restricoes,
+        options={"disp": False}
+    )
+
+    if not resultado.success:
+        raise RuntimeError(
+            "Não foi possível resolver a maximização: "
+            + resultado.message
+        )
+
+    quantidades = np.rint(resultado.x).astype(int)
+
+    resultado_df = pd.DataFrame({
+        "Modelo": modelos,
+        "Quantidade recomendada": quantidades,
+        "Margem unitária (R$)": [
+            margens[m] for m in modelos
+        ],
+        "Custo de produção (R$)": [
+            custos[m] * quantidades[i]
+            for i, m in enumerate(modelos)
+        ],
+        "Margem total (R$)": [
+            margens[m] * quantidades[i]
+            for i, m in enumerate(modelos)
+        ]
+    })
+
+    lucro_total = float(
+        resultado_df["Margem total (R$)"].sum()
+    )
+
+    custo_total = float(
+        resultado_df["Custo de produção (R$)"].sum()
+    )
+
+    quantidade_total = int(quantidades.sum())
+
+    return {
+        "tabela": resultado_df,
+        "lucro": lucro_total,
+        "custo": custo_total,
+        "quantidade": quantidade_total
+    }
+
+
+# ============================================================
+# 7. RESOLUÇÃO DO PROBLEMA DE MAXIMIZAÇÃO
+# ============================================================
+
+print("\n" + "=" * 65)
+print("PROBLEMA 1 - MAXIMIZAÇÃO DO LUCRO")
+print("=" * 65)
+
+resultado_max = resolver_maximizacao(ORCAMENTO)
+
+print("\nQuantidade recomendada por produto:")
+print(resultado_max["tabela"].to_string(index=False))
+
+print("\nRESULTADO DA MAXIMIZAÇÃO")
+print(f"Quantidade total: {resultado_max['quantidade']} pares")
+print(f"Custo total: R$ {resultado_max['custo']:,.2f}")
+print(f"Margem total estimada: R$ {resultado_max['lucro']:,.2f}")
+print(f"Orçamento disponível: R$ {ORCAMENTO:,.2f}")
+print(
+    f"Orçamento não utilizado: "
+    f"R$ {ORCAMENTO - resultado_max['custo']:,.2f}"
+)
+
+
+# ============================================================
+# 8. WHAT-IF 1 - REDUÇÃO DO ORÇAMENTO
+# ============================================================
+
+print("\n" + "=" * 65)
+print("WHAT-IF 1 - REDUÇÃO DO ORÇAMENTO")
+print("=" * 65)
+
+resultado_wh_if = resolver_maximizacao(ORCAMENTO_WHAT_IF)
+
+comparacao_lucro = pd.DataFrame({
+    "Indicador": [
+        "Orçamento",
+        "Quantidade total",
+        "Custo de produção",
+        "Margem total estimada"
+    ],
+    "Cenário original": [
+        ORCAMENTO,
+        resultado_max["quantidade"],
+        resultado_max["custo"],
+        resultado_max["lucro"]
+    ],
+    "Cenário What-If": [
+        ORCAMENTO_WHAT_IF,
+        resultado_wh_if["quantidade"],
+        resultado_wh_if["custo"],
+        resultado_wh_if["lucro"]
+    ]
+})
+
+print(comparacao_lucro.to_string(index=False))
+
+print("\nProdução recomendada no cenário de orçamento reduzido:")
+print(resultado_wh_if["tabela"].to_string(index=False))
+
+
+# ============================================================
+# 9. PREPARAÇÃO DO PROBLEMA DE TRANSPORTE
+# ============================================================
+
+def padronizar_cd(valor):
+
+    texto = normalizar_texto(valor)
+
+    if "recife" in texto:
+        return "Recife"
+
+    if "sao paulo" in texto or texto == "sp":
+        return "São Paulo"
+
+    return None
+
+
+df["cd_padronizado"] = df["cd_origem"].apply(padronizar_cd)
+
+df_cd = df.dropna(subset=["cd_padronizado"]).copy()
+
+if df_cd.empty:
+    raise ValueError(
+        "Não foi possível identificar centros de distribuição "
+        "de São Paulo ou Recife na coluna cd_origem."
+    )
+
+vendas_cd = (
+    df_cd.groupby("cd_padronizado")["quantidade"]
+    .sum()
+    .to_dict()
+)
+
+vendas_sp = float(vendas_cd.get("São Paulo", 0))
+vendas_recife = float(vendas_cd.get("Recife", 0))
+
+total_historico_cd = vendas_sp + vendas_recife
+
+if total_historico_cd <= 0:
+    raise ValueError(
+        "Não há quantidade histórica válida para os centros de distribuição."
+    )
+
+# Calcula a quantidade média de pares por pedido
+pares_por_pedido = (
+    df.groupby("pedido_id")["quantidade"].sum()
+)
+
+media_pares_pedido = float(pares_por_pedido.mean())
+
+if not np.isfinite(media_pares_pedido) or media_pares_pedido <= 0:
+    media_pares_pedido = 1.0
+
+# Quantidade a transportar: resultado da maximização original
+total_a_transportar = resultado_max["quantidade"]
+
+if total_a_transportar <= 0:
+    print(
+        "\nA maximização recomendou produção igual a zero. "
+        "Não há quantidade para distribuir no problema de transporte."
+    )
+else:
+
+    # Distribuição da oferta conforme a participação histórica dos CDs
+    participacao_sp = vendas_sp / total_historico_cd
+    participacao_recife = vendas_recife / total_historico_cd
+
+    def distribuir_inteiro(total, pesos):
+
+        pesos = np.array(pesos, dtype=float)
+        valores = total * pesos / pesos.sum()
+
+        inteiros = np.floor(valores).astype(int)
+        restantes = int(total - inteiros.sum())
+
+        ordem = np.argsort(-(valores - inteiros))
+
+        for i in ordem[:restantes]:
+            inteiros[i] += 1
+
+        return inteiros
+
+    oferta_sp, oferta_recife = distribuir_inteiro(
+        total_a_transportar,
+        [participacao_sp, participacao_recife]
+    )
+
+    # Demanda hipotética por região:
+    # 55% Sudeste/Sul e 45% Nordeste/Norte
+    demanda_sudeste, demanda_nordeste = distribuir_inteiro(
+        total_a_transportar,
+        [0.55, 0.45]
+    )
+
+    print("\nDISTRIBUIÇÃO ESTIMADA DA OFERTA")
+    print("São Paulo:", oferta_sp, "pares")
+    print("Recife:", oferta_recife, "pares")
+
+    print("\nDEMANDA REGIONAL CONSIDERADA")
+    print("Sudeste/Sul:", demanda_sudeste, "pares")
+    print("Nordeste/Norte:", demanda_nordeste, "pares")
+
+
+    # ========================================================
+    # 10. FUNÇÃO DE MINIMIZAÇÃO DO TRANSPORTE
+    # ========================================================
+
+    def resolver_transporte(frete_entre_regioes):
+
+        # Variáveis:
+        # 0 = São Paulo -> Sudeste/Sul
+        # 1 = São Paulo -> Nordeste/Norte
+        # 2 = Recife -> Sudeste/Sul
+        # 3 = Recife -> Nordeste/Norte
+
+        frete_local_por_par = FRETE_LOCAL / media_pares_pedido
+
+        frete_distante_por_par = (
+            frete_entre_regioes / media_pares_pedido
+        )
+
+        custos_rotas = np.array([
+            frete_local_por_par,
+            frete_distante_por_par,
+            frete_distante_por_par,
+            frete_local_por_par
+        ], dtype=float)
+
+        # Restrições de oferta e demanda
+        matriz_transporte = np.array([
+            [1, 1, 0, 0],  # Oferta de São Paulo
+            [0, 0, 1, 1],  # Oferta de Recife
+            [1, 0, 1, 0],  # Demanda Sudeste/Sul
+            [0, 1, 0, 1]   # Demanda Nordeste/Norte
+        ], dtype=float)
+
+        valores = np.array([
+            oferta_sp,
+            oferta_recife,
+            demanda_sudeste,
+            demanda_nordeste
+        ], dtype=float)
+
+        restricoes_transporte = LinearConstraint(
+            matriz_transporte,
+            lb=valores,
+            ub=valores
+        )
+
+        resultado = milp(
+            c=custos_rotas,
+            integrality=np.ones(4),
+            bounds=Bounds(
+                lb=np.zeros(4),
+                ub=np.full(4, np.inf)
+            ),
+            constraints=restricoes_transporte,
+            options={"disp": False}
+        )
+
+        if not resultado.success:
+            raise RuntimeError(
+                "Não foi possível resolver o transporte: "
+                + resultado.message
+            )
+
+        quantidades = np.rint(resultado.x).astype(int)
+
+        rotas = pd.DataFrame({
+            "Origem": [
+                "São Paulo",
+                "São Paulo",
+                "Recife",
+                "Recife"
+            ],
+            "Destino": [
+                "Sudeste/Sul",
+                "Nordeste/Norte",
+                "Sudeste/Sul",
+                "Nordeste/Norte"
+            ],
+            "Quantidade transportada": quantidades,
+            "Custo por par (R$)": custos_rotas,
+            "Custo total (R$)": quantidades * custos_rotas
+        })
+
+        custo_total_transporte = float(
+            rotas["Custo total (R$)"].sum()
+        )
+
+        return {
+            "rotas": rotas,
+            "custo": custo_total_transporte
+        }
+
+
+    # ========================================================
+    # 11. RESOLUÇÃO DO PROBLEMA DE TRANSPORTE
+    # ========================================================
+
+    print("\n" + "=" * 65)
+    print("PROBLEMA 2 - MINIMIZAÇÃO DOS CUSTOS DE TRANSPORTE")
+    print("=" * 65)
+
+    transporte_original = resolver_transporte(
+        FRETE_ENTRE_REGIOES
+    )
+
+    print("\nDistribuição otimizada das entregas:")
+    print(
+        transporte_original["rotas"].to_string(index=False)
+    )
+
+    print(
+        "\nCusto total estimado de transporte: "
+        f"R$ {transporte_original['custo']:,.2f}"
+    )
+
+
+    # ========================================================
+    # 12. WHAT-IF 2 - AUMENTO DO FRETE ENTRE REGIÕES
+    # ========================================================
+
+    print("\n" + "=" * 65)
+    print("WHAT-IF 2 - AUMENTO DO FRETE ENTRE REGIÕES")
+    print("=" * 65)
+
+    transporte_wh_if = resolver_transporte(
+        FRETE_ENTRE_REGIOES_WHAT_IF
+    )
+
+    comparacao_transporte = pd.DataFrame({
+        "Indicador": [
+            "Frete entre regiões por pedido",
+            "Custo total de transporte"
+        ],
+        "Cenário original": [
+            FRETE_ENTRE_REGIOES,
+            transporte_original["custo"]
+        ],
+        "Cenário What-If": [
+            FRETE_ENTRE_REGIOES_WHAT_IF,
+            transporte_wh_if["custo"]
+        ]
+    })
+
+    print(comparacao_transporte.to_string(index=False))
+
+    print("\nRotas no cenário de frete elevado:")
+    print(
+        transporte_wh_if["rotas"].to_string(index=False)
+    )
+
+
+# ============================================================
+# 13. RESUMO FINAL
+# ============================================================
+
+print("\n" + "=" * 65)
+print("RESUMO FINAL - PESQUISA OPERACIONAL STRIDEZONE")
+print("=" * 65)
+
+print("\nMAXIMIZAÇÃO DO LUCRO")
+print(
+    f"Margem estimada original: "
+    f"R$ {resultado_max['lucro']:,.2f}"
+)
+print(
+    f"Margem estimada com orçamento reduzido: "
+    f"R$ {resultado_wh_if['lucro']:,.2f}"
+)
+
+if total_a_transportar > 0:
+    print("\nMINIMIZAÇÃO DO TRANSPORTE")
+    print(
+        f"Custo original: "
+        f"R$ {transporte_original['custo']:,.2f}"
+    )
+    print(
+        f"Custo com aumento do frete: "
+        f"R$ {transporte_wh_if['custo']:,.2f}"
+    )
+
+print("\n" + "=" * 65)
+print("EXECUÇÃO CONCLUÍDA!")
+print("=" * 65)
